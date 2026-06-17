@@ -1,6 +1,8 @@
 import socket
 import sys
 import time
+import os
+import ipaddress
 
 if len(sys.argv) < 2:
     print("Usage: python3 test_flood.py <TARGET_IP_OR_INTERFACE> [udp|tcp|udp6|arp]")
@@ -11,6 +13,30 @@ proto = sys.argv[2] if len(sys.argv) > 2 else "udp"
 proto = proto.lower()
 port = 8000
 data = b"X" * 1024
+
+# Safety: by default only allow targeting loopback (localhost).
+# To permit external targets you must BOTH set env var `ALLOW_TEST_FLOOD_EXTERNAL=1`
+# and pass the `--allow-external` flag on the command line.
+allow_external_flag = '--allow-external' in sys.argv
+allow_external_env = os.getenv('ALLOW_TEST_FLOOD_EXTERNAL') == '1'
+
+# For ARP mode the `target` is expected to be a local interface name (e.g., eth0)
+is_arp_mode = proto == 'arp'
+
+if not is_arp_mode:
+    try:
+        dest_ip = socket.gethostbyname(target)
+        ip_obj = ipaddress.ip_address(dest_ip)
+        if not ip_obj.is_loopback and not (allow_external_env and allow_external_flag):
+            print("[!] Safety check: external targets are disabled by default.")
+            print("    To allow external targets set ALLOW_TEST_FLOOD_EXTERNAL=1 and pass --allow-external flag.")
+            sys.exit(1)
+    except Exception:
+        # If resolution fails, be conservative and refuse to run unless explicit allow
+        if not (allow_external_env and allow_external_flag):
+            print("[!] Safety check: could not resolve target; external targets disabled by default.")
+            print("    To allow external targets set ALLOW_TEST_FLOOD_EXTERNAL=1 and pass --allow-external flag.")
+            sys.exit(1)
 
 print(f"[!] Target: {target} | Mode: {proto.upper()} | Starting Volumetric Storm...")
 count = 0
