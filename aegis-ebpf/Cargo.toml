@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/aya-rs/aya" }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "c1eb42780c8e0eba340808eb4b75df15ac434e61" }
 aegis-common = { path = "../aegis-common" }
 
 [[bin]]

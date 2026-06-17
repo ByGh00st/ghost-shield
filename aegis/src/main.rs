@@ -34,9 +34,15 @@ fn parse_cidr(cidr_str: &str) -> Result<ParsedIp, anyhow::Error> {
     if let Some((ip_str, mask_str)) = clean_str.split_once('/') {
         let mask: u32 = mask_str.parse()?;
         if let Ok(ip4) = ip_str.parse::<Ipv4Addr>() {
+            if mask > 32 {
+                return Err(anyhow::anyhow!("Invalid IPv4 CIDR prefix mask: {} (must be <= 32)", mask));
+            }
             Ok(ParsedIp::V4(mask, ip4.octets()))
         } else {
             let ip6 = ip_str.parse::<Ipv6Addr>()?;
+            if mask > 128 {
+                return Err(anyhow::anyhow!("Invalid IPv6 CIDR prefix mask: {} (must be <= 128)", mask));
+            }
             Ok(ParsedIp::V6(mask, ip6.octets()))
         }
     } else {
@@ -178,10 +184,13 @@ async fn main() -> Result<(), anyhow::Error> {
             let mut vip_macs = HashMap::<_, [u8; 6], u32>::try_from(map)?;
             if let Some(ref gw_ip) = gw_ip_opt {
                 if let Some(gw_mac) = get_mac_for_ip(gw_ip) {
-                    let _ = vip_macs.insert(gw_mac, 1, 0);
-                    gateway_mac_resolved = true;
-                    println!("[INFO] Gateway MAC resolved on startup: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]);
+                    if let Err(e) = vip_macs.insert(gw_mac, 1, 0) {
+                        eprintln!("[ERROR] Failed to insert gateway MAC to VIP_LIST_MAC map: {}", e);
+                    } else {
+                        gateway_mac_resolved = true;
+                        println!("[INFO] Gateway MAC resolved on startup: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]);
+                    }
                 } else {
                     println!("[WARN] Gateway MAC not resolved in ARP cache on startup. Safe polling active in background.");
                 }
@@ -198,16 +207,23 @@ async fn main() -> Result<(), anyhow::Error> {
         let mut vip6_map: LpmTrie<_, [u8; 16], u32> = LpmTrie::try_from(vip6_raw)?;
         
         for checker in &config.checkers {
-            if let Ok(parsed) = parse_cidr(checker) {
-                match parsed {
+            match parse_cidr(checker) {
+                Ok(parsed) => match parsed {
                     ParsedIp::V4(prefix, octets) => {
                         let key = Key::new(prefix, octets);
-                        let _ = vip4_map.insert(&key, 1u32, 0);
+                        if let Err(e) = vip4_map.insert(&key, 1u32, 0) {
+                            eprintln!("[ERROR] Failed to insert IPv4 CIDR checker {} to VIP_LIST map: {}", checker, e);
+                        }
                     }
                     ParsedIp::V6(prefix, octets) => {
                         let key = Key::new(prefix, octets);
-                        let _ = vip6_map.insert(&key, 1u32, 0);
+                        if let Err(e) = vip6_map.insert(&key, 1u32, 0) {
+                            eprintln!("[ERROR] Failed to insert IPv6 CIDR checker {} to VIP_LIST_V6 map: {}", checker, e);
+                        }
                     }
+                },
+                Err(e) => {
+                    eprintln!("[ERROR] Failed to parse CIDR checker {}: {}", checker, e);
                 }
             }
         }
@@ -414,8 +430,11 @@ async fn main() -> Result<(), anyhow::Error> {
                         if let Some(gw_mac) = get_mac_for_ip(gw_ip) {
                             if let Some(map) = bpf_guard.map_mut("VIP_LIST_MAC") {
                                 if let Ok(mut vip_macs) = HashMap::<_, [u8; 6], u32>::try_from(map) {
-                                    let _ = vip_macs.insert(gw_mac, 1, 0);
-                                    gateway_mac_resolved = true;
+                                    if let Err(e) = vip_macs.insert(gw_mac, 1, 0) {
+                                        eprintln!("[ERROR] Failed to insert gateway MAC to VIP_LIST_MAC map during polling: {}", e);
+                                    } else {
+                                        gateway_mac_resolved = true;
+                                    }
                                 }
                             }
                         }
@@ -491,7 +510,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         alert_active = true;
                         if let Some(map) = bpf_guard.map_mut("G_CONFIG") {
                             if let Ok(mut g_conf) = Array::<_, GlobalConfig>::try_from(map) {
-                                let _ = g_conf.set(0, GlobalConfig {
+                                if let Err(e) = g_conf.set(0, GlobalConfig {
                                     alert_mode: 1,
                                     normal_mode_limit: config.normal_mode_limit,
                                     panic_mode_limit: config.panic_mode_limit,
@@ -499,7 +518,9 @@ async fn main() -> Result<(), anyhow::Error> {
                                     ban_duration_sec: config.ban_duration_sec,
                                     arp_mode_limit: config.arp_mode_limit,
                                     mac_mode_limit: config.mac_mode_limit,
-                                }, 0);
+                                }, 0) {
+                                    eprintln!("[ERROR] Failed to set G_CONFIG alert_mode to 1: {}", e);
+                                }
                             }
                         }
                     }
@@ -512,7 +533,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             alert_active = false;
                             if let Some(map) = bpf_guard.map_mut("G_CONFIG") {
                                 if let Ok(mut g_conf) = Array::<_, GlobalConfig>::try_from(map) {
-                                    let _ = g_conf.set(0, GlobalConfig {
+                                    if let Err(e) = g_conf.set(0, GlobalConfig {
                                         alert_mode: 0,
                                         normal_mode_limit: config.normal_mode_limit,
                                         panic_mode_limit: config.panic_mode_limit,
@@ -520,7 +541,9 @@ async fn main() -> Result<(), anyhow::Error> {
                                         ban_duration_sec: config.ban_duration_sec,
                                         arp_mode_limit: config.arp_mode_limit,
                                         mac_mode_limit: config.mac_mode_limit,
-                                    }, 0);
+                                    }, 0) {
+                                        eprintln!("[ERROR] Failed to set G_CONFIG alert_mode to 0: {}", e);
+                                    }
                                 }
                             }
                         }
