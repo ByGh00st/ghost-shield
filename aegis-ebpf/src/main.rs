@@ -120,7 +120,7 @@ static TRAFFIC_ARP: LruHashMap<[u8; 6], IPStats> = LruHashMap::with_max_entries(
 
 // Perf Alert Events
 #[map]
-static EVENTS: PerfEventArray<MitigationEvent> = PerfEventArray::with_max_entries(1024, 0);
+static EVENTS: PerfEventArray<MitigationEvent> = PerfEventArray::new(0);
 
 // Helper: increment drop counter and return XDP_DROP
 #[inline(always)]
@@ -173,28 +173,30 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
 
         // Rate-limit MAC address to prevent MAC table flooding
         if let Some(st) = unsafe { TRAFFIC_MAC.get_ptr_mut(&src_mac).map(|v| &mut *v) } {
-            if now - st.last_ts < 1_000_000_000 {
-                st.pkt_count += 1;
-                if st.pkt_count > mac_limit {
-                    let ban_expiry = now + ban_duration_ns;
-                    unsafe { let _ = BLACKLIST_MAC.insert(&src_mac, &ban_expiry, 0); }
-                    let event = MitigationEvent {
-                        src_ip: [0u8; 16],
-                        src_mac,
-                        dest_port: 0,
-                        protocol: 0,
-                        action: 2, // BAN
-                        ip_version: 0,
-                    };
-                    EVENTS.output(&ctx, &event, 0);
-                    return drop_and_count();
-                }
-            } else {
-                st.pkt_count = 1;
+            let delta = now.saturating_sub(st.last_ts).min(1_000_000_000);
+            let refilled = (delta * mac_limit as u64) / 1_000_000_000;
+            let new_tokens = (st.tokens as u64 + refilled).min(mac_limit as u64);
+            if new_tokens >= 1 {
+                st.tokens = (new_tokens - 1) as u32;
                 st.last_ts = now;
+            } else {
+                st.tokens = new_tokens as u32;
+                st.last_ts = now;
+                let ban_expiry = now + ban_duration_ns;
+                unsafe { let _ = BLACKLIST_MAC.insert(&src_mac, &ban_expiry, 0); }
+                let event = MitigationEvent {
+                    src_ip: [0u8; 16],
+                    src_mac,
+                    dest_port: 0,
+                    protocol: 0,
+                    action: 2, // BAN
+                    ip_version: 0,
+                };
+                EVENTS.output(&ctx, &event, 0);
+                return drop_and_count();
             }
         } else {
-            unsafe { let _ = TRAFFIC_MAC.insert(&src_mac, &IPStats { pkt_count: 1, last_ts: now }, 0); }
+            unsafe { let _ = TRAFFIC_MAC.insert(&src_mac, &IPStats { tokens: mac_limit / 2, _padding: 0, last_ts: now }, 0); }
         }
     }
 
@@ -244,30 +246,32 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
 
         // IP Rate Limit
         if let Some(st) = unsafe { TRAFFIC.get_ptr_mut(&src_ip).map(|v| &mut *v) } {
-            if now - st.last_ts < 1_000_000_000 {
-                st.pkt_count += 1;
-                if st.pkt_count > ip_limit {
-                    let ban_expiry = now + ban_duration_ns;
-                    unsafe { let _ = BLACKLIST.insert(&src_ip, &ban_expiry, 0); }
-                    let mut event_ip = [0u8; 16];
-                    event_ip[0..4].copy_from_slice(&src_be.to_ne_bytes());
-                    let event = MitigationEvent {
-                        src_ip: event_ip,
-                        src_mac,
-                        dest_port,
-                        protocol,
-                        action: 2, // BAN
-                        ip_version: 4,
-                    };
-                    EVENTS.output(&ctx, &event, 0);
-                    return drop_and_count();
-                }
-            } else {
-                st.pkt_count = 1;
+            let delta = now.saturating_sub(st.last_ts).min(1_000_000_000);
+            let refilled = (delta * ip_limit as u64) / 1_000_000_000;
+            let new_tokens = (st.tokens as u64 + refilled).min(ip_limit as u64);
+            if new_tokens >= 1 {
+                st.tokens = (new_tokens - 1) as u32;
                 st.last_ts = now;
+            } else {
+                st.tokens = new_tokens as u32;
+                st.last_ts = now;
+                let ban_expiry = now + ban_duration_ns;
+                unsafe { let _ = BLACKLIST.insert(&src_ip, &ban_expiry, 0); }
+                let mut event_ip = [0u8; 16];
+                event_ip[0..4].copy_from_slice(&src_be.to_ne_bytes());
+                let event = MitigationEvent {
+                    src_ip: event_ip,
+                    src_mac,
+                    dest_port,
+                    protocol,
+                    action: 2, // BAN
+                    ip_version: 4,
+                };
+                EVENTS.output(&ctx, &event, 0);
+                return drop_and_count();
             }
         } else {
-            unsafe { let _ = TRAFFIC.insert(&src_ip, &IPStats { pkt_count: 1, last_ts: now }, 0); }
+            unsafe { let _ = TRAFFIC.insert(&src_ip, &IPStats { tokens: ip_limit / 2, _padding: 0, last_ts: now }, 0); }
         }
 
     } else if proto == 0x86DD {
@@ -277,7 +281,30 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
         }
         let ip6 = (s + 14) as *const ipv6hdr;
         let src_ip6 = unsafe { (*ip6).saddr };
-        let protocol = unsafe { (*ip6).nexthdr };
+
+        // Parse IPv6 Extension Headers to prevent protocol bypass (Hop-by-Hop, Routing, Fragment, Destination Options)
+        let mut protocol = unsafe { (*ip6).nexthdr };
+        let mut next_hdr_offset = 14 + 40;
+        for _ in 0..4 {
+            match protocol {
+                0 | 43 | 44 | 60 => {
+                    if s + next_hdr_offset + 2 > e {
+                        break;
+                    }
+                    let ext_hdr = (s + next_hdr_offset) as *const u8;
+                    let next_proto = unsafe { *ext_hdr };
+                    let hdr_len = unsafe { *ext_hdr.add(1) };
+                    let len = if protocol == 44 {
+                        8
+                    } else {
+                        (hdr_len as usize + 1) * 8
+                    };
+                    protocol = next_proto;
+                    next_hdr_offset += len;
+                }
+                _ => break,
+            }
+        }
 
         // VIP Bypass
         let key = aya_ebpf::maps::lpm_trie::Key::new(128, src_ip6);
@@ -293,13 +320,13 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
         // L4 Destination Port Parsing
         let mut dest_port: u16 = 0;
         if protocol == 6 {
-            let tcp_offset = 14 + 40;
+            let tcp_offset = next_hdr_offset;
             if s + tcp_offset + 20 <= e {
                 let tcp = (s + tcp_offset) as *const tcphdr;
                 dest_port = u16::from_be(unsafe { (*tcp).dest });
             }
         } else if protocol == 17 {
-            let udp_offset = 14 + 40;
+            let udp_offset = next_hdr_offset;
             if s + udp_offset + 8 <= e {
                 let udp = (s + udp_offset) as *const udphdr;
                 dest_port = u16::from_be(unsafe { (*udp).dest });
@@ -308,28 +335,30 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
 
         // IPv6 Rate Limit
         if let Some(st) = unsafe { TRAFFIC_V6.get_ptr_mut(&src_ip6).map(|v| &mut *v) } {
-            if now - st.last_ts < 1_000_000_000 {
-                st.pkt_count += 1;
-                if st.pkt_count > ip_limit {
-                    let ban_expiry = now + ban_duration_ns;
-                    unsafe { let _ = BLACKLIST_V6.insert(&src_ip6, &ban_expiry, 0); }
-                    let event = MitigationEvent {
-                        src_ip: src_ip6,
-                        src_mac,
-                        dest_port,
-                        protocol,
-                        action: 2, // BAN
-                        ip_version: 6,
-                    };
-                    EVENTS.output(&ctx, &event, 0);
-                    return drop_and_count();
-                }
-            } else {
-                st.pkt_count = 1;
+            let delta = now.saturating_sub(st.last_ts).min(1_000_000_000);
+            let refilled = (delta * ip_limit as u64) / 1_000_000_000;
+            let new_tokens = (st.tokens as u64 + refilled).min(ip_limit as u64);
+            if new_tokens >= 1 {
+                st.tokens = (new_tokens - 1) as u32;
                 st.last_ts = now;
+            } else {
+                st.tokens = new_tokens as u32;
+                st.last_ts = now;
+                let ban_expiry = now + ban_duration_ns;
+                unsafe { let _ = BLACKLIST_V6.insert(&src_ip6, &ban_expiry, 0); }
+                let event = MitigationEvent {
+                    src_ip: src_ip6,
+                    src_mac,
+                    dest_port,
+                    protocol,
+                    action: 2, // BAN
+                    ip_version: 6,
+                };
+                EVENTS.output(&ctx, &event, 0);
+                return drop_and_count();
             }
         } else {
-            unsafe { let _ = TRAFFIC_V6.insert(&src_ip6, &IPStats { pkt_count: 1, last_ts: now }, 0); }
+            unsafe { let _ = TRAFFIC_V6.insert(&src_ip6, &IPStats { tokens: ip_limit / 2, _padding: 0, last_ts: now }, 0); }
         }
 
     } else if proto == 0x0806 {
@@ -343,31 +372,33 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
         if !is_vip_mac {
             // Rate limit ARP to 50 pps per source MAC to protect local bridge / switch
             if let Some(st) = unsafe { TRAFFIC_ARP.get_ptr_mut(&src_mac).map(|v| &mut *v) } {
-                if now - st.last_ts < 1_000_000_000 {
-                    st.pkt_count += 1;
-                    if st.pkt_count > arp_limit {
-                        let ban_expiry = now + ban_duration_ns;
-                        unsafe { let _ = BLACKLIST_MAC.insert(&src_mac, &ban_expiry, 0); }
-                        
-                        let mut event_ip = [0u8; 16];
-                        event_ip[0..4].copy_from_slice(&sender_ip);
-                        let event = MitigationEvent {
-                            src_ip: event_ip,
-                            src_mac,
-                            dest_port: 0,
-                            protocol: 20, // Custom value representing ARP
-                            action: 2, // BAN
-                            ip_version: 0,
-                        };
-                        EVENTS.output(&ctx, &event, 0);
-                        return drop_and_count();
-                    }
-                } else {
-                    st.pkt_count = 1;
+                let delta = now.saturating_sub(st.last_ts).min(1_000_000_000);
+                let refilled = (delta * arp_limit as u64) / 1_000_000_000;
+                let new_tokens = (st.tokens as u64 + refilled).min(arp_limit as u64);
+                if new_tokens >= 1 {
+                    st.tokens = (new_tokens - 1) as u32;
                     st.last_ts = now;
+                } else {
+                    st.tokens = new_tokens as u32;
+                    st.last_ts = now;
+                    let ban_expiry = now + ban_duration_ns;
+                    unsafe { let _ = BLACKLIST_MAC.insert(&src_mac, &ban_expiry, 0); }
+                    
+                    let mut event_ip = [0u8; 16];
+                    event_ip[0..4].copy_from_slice(&sender_ip);
+                    let event = MitigationEvent {
+                        src_ip: event_ip,
+                        src_mac,
+                        dest_port: 0,
+                        protocol: 20, 
+                        action: 2, 
+                        ip_version: 0,
+                    };
+                    EVENTS.output(&ctx, &event, 0);
+                    return drop_and_count();
                 }
             } else {
-                unsafe { let _ = TRAFFIC_ARP.insert(&src_mac, &IPStats { pkt_count: 1, last_ts: now }, 0); }
+                unsafe { let _ = TRAFFIC_ARP.insert(&src_mac, &IPStats { tokens: arp_limit / 2, _padding: 0, last_ts: now }, 0); }
             }
         }
     }
