@@ -1,12 +1,11 @@
 use aya::programs::{Xdp, XdpMode};
-use aya::maps::{LpmTrie, PerCpuArray, Array, HashMap, lpm_trie::Key, perf::AsyncPerfEventArray};
+use aya::maps::{LpmTrie, PerCpuArray, Array, HashMap, lpm_trie::Key, PerfEventArray};
 use aya::util::online_cpus;
 use aya::{include_bytes_aligned, Ebpf};
-use bytes::BytesMut;
 use std::{env, net::Ipv4Addr, net::Ipv6Addr};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use tokio::signal;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::time::sleep;
 use aegis_common::{GlobalConfig, GlobalStats, MitigationEvent};
 use std::sync::Arc;
@@ -62,11 +61,7 @@ fn get_monotonic_ns() -> u64 {
 }
 
 fn get_timestamp() -> String {
-    if let Ok(n) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        format!("{}", n.as_secs())
-    } else {
-        "0".to_string()
-    }
+    chrono::Utc::now().to_rfc3339()
 }
 
 fn get_gateway_ip() -> Option<String> {
@@ -127,11 +122,37 @@ async fn main() -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("Failed to locate or read config.json: {}", e))?;
     let config: ConfigFile = serde_json::from_str(&config_content)?;
 
+    // Validate configuration limits to prevent logical flaws
+    if config.global_alert_pps == 0 {
+        return Err(anyhow::anyhow!("Config error: global_alert_pps cannot be 0 (would trigger instant panic mode)"));
+    }
+    if config.panic_mode_limit >= config.normal_mode_limit {
+        return Err(anyhow::anyhow!(
+            "Config error: panic_mode_limit ({}) must be strictly less than normal_mode_limit ({}) to apply stricter filtering under panic mode",
+            config.panic_mode_limit,
+            config.normal_mode_limit
+        ));
+    }
+    if config.ban_duration_sec == 0 {
+        return Err(anyhow::anyhow!("Config error: ban_duration_sec cannot be 0"));
+    }
+
     let mut bpf = Ebpf::load(include_bytes_aligned!("../../target/bpfel-unknown-none/release/aegis"))?;
     
     let prog: &mut Xdp = bpf.program_mut("apex_shield").unwrap().try_into()?;
     prog.load()?;
-    let _ = prog.attach(&dev, XdpMode::Driver).or_else(|_| prog.attach(&dev, XdpMode::Skb));
+    match prog.attach(&dev, XdpMode::Driver) {
+        Ok(_) => println!("[INFO] Apex Shield successfully attached in Driver (Native) mode."),
+        Err(e) => {
+            println!("[WARN] Driver mode failed ({}). Falling back to Skb (Generic) mode (lower performance)...", e);
+            if let Err(e2) = prog.attach(&dev, XdpMode::Skb) {
+                eprintln!("[ERROR] Generic Skb mode attach failed: {}", e2);
+                return Err(e2.into());
+            } else {
+                println!("[INFO] Apex Shield successfully attached in Skb (Generic) fallback mode.");
+            }
+        }
+    }
 
     // Populate initial configs in eBPF Map
     {
@@ -141,6 +162,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 alert_mode: 0,
                 normal_mode_limit: config.normal_mode_limit,
                 panic_mode_limit: config.panic_mode_limit,
+                _padding: 0,
                 ban_duration_sec: config.ban_duration_sec,
                 arp_mode_limit: config.arp_mode_limit,
                 mac_mode_limit: config.mac_mode_limit,
@@ -148,13 +170,20 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
+    let mut gateway_mac_resolved = false;
+    let gw_ip_opt = get_gateway_ip();
     // Populate VIP MACs to protect the Gateway / core routing path
     {
         if let Some(map) = bpf.map_mut("VIP_LIST_MAC") {
             let mut vip_macs = HashMap::<_, [u8; 6], u32>::try_from(map)?;
-            if let Some(gw_ip) = get_gateway_ip() {
-                if let Some(gw_mac) = get_mac_for_ip(&gw_ip) {
+            if let Some(ref gw_ip) = gw_ip_opt {
+                if let Some(gw_mac) = get_mac_for_ip(gw_ip) {
                     let _ = vip_macs.insert(gw_mac, 1, 0);
+                    gateway_mac_resolved = true;
+                    println!("[INFO] Gateway MAC resolved on startup: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]);
+                } else {
+                    println!("[WARN] Gateway MAC not resolved in ARP cache on startup. Safe polling active in background.");
                 }
             }
         }
@@ -162,8 +191,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Populate VIP lists (both IPv4 and IPv6) from config checkers
     {
-        let mut vip4_map: LpmTrie<_, [u8; 4], u32> = LpmTrie::try_from(bpf.map_mut("VIP_LIST").unwrap())?;
-        let mut vip6_map: LpmTrie<_, [u8; 16], u32> = LpmTrie::try_from(bpf.map_mut("VIP_LIST_V6").unwrap())?;
+        let [Some(vip4_raw), Some(vip6_raw)] = bpf.maps_disjoint_mut(["VIP_LIST", "VIP_LIST_V6"]) else {
+            return Err(anyhow::anyhow!("Missing VIP_LIST or VIP_LIST_V6 maps"));
+        };
+        let mut vip4_map: LpmTrie<_, [u8; 4], u32> = LpmTrie::try_from(vip4_raw)?;
+        let mut vip6_map: LpmTrie<_, [u8; 16], u32> = LpmTrie::try_from(vip6_raw)?;
         
         for checker in &config.checkers {
             if let Ok(parsed) = parse_cidr(checker) {
@@ -182,223 +214,288 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Open mitigation event log file
-    let log_file = OpenOptions::new()
+    let log_file = match OpenOptions::new()
         .create(true)
         .append(true)
         .open("/var/log/hydra_waf.log")
         .await
-        .or_else(|_| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("hydra_waf.log")
-        })?;
-    let log_writer = Arc::new(Mutex::new(log_file));
+    {
+        Ok(f) => f,
+        Err(_) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("hydra_waf.log")
+            .await?,
+    };
 
     // Shared state for alerts & TUI
     let recent_alerts = Arc::new(Mutex::new(VecDeque::new()));
     let recent_alerts_clone = Arc::clone(&recent_alerts);
-    let log_writer_clone = Arc::clone(&log_writer);
+
+    // Async channel for non-blocking log writing
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(10000);
+    let _log_tx_guard = log_tx.clone();
+    
+    // Spawn dedicated log writer task
+    tokio::spawn(async move {
+        let mut file = log_file; // Take ownership of the log file
+        while let Some(log_entry) = log_rx.recv().await {
+            let _ = file.write_all(log_entry.as_bytes()).await;
+        }
+    });
 
     // Read Events from eBPF PerfEventArray
-    if let Some(map) = bpf.map_mut("EVENTS") {
-        let mut perf_array = AsyncPerfEventArray::try_from(map)?;
-        for cpu_id in online_cpus()? {
-            let mut buf = perf_array.open(cpu_id, None)?;
+    if let Some(map) = bpf.take_map("EVENTS") {
+        let mut perf_array = PerfEventArray::try_from(map)?;
+        for cpu_id in online_cpus().map_err(|e| anyhow::anyhow!("{}: {}", e.0, e.1))? {
+            let buf = perf_array.open(cpu_id, None)?;
             let recent_alerts_local = Arc::clone(&recent_alerts_clone);
-            let log_writer_local = Arc::clone(&log_writer_clone);
+            let log_tx_local = log_tx.clone();
             
             tokio::spawn(async move {
-                let mut buffers = (0..10)
-                    .map(|_| BytesMut::with_capacity(1024))
-                    .collect::<Vec<_>>();
+                use tokio::io::unix::AsyncFd;
+                let mut async_buf = match AsyncFd::new(buf) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[ERROR] Failed to create AsyncFd for perf buffer: {}", e);
+                        return;
+                    }
+                };
+
                 loop {
-                    if let Ok(events) = buf.read_events(&mut buffers).await {
-                        for buf in buffers.iter_mut().take(events.read) {
-                            let ptr = buf.as_ptr() as *const MitigationEvent;
-                            let event = unsafe { ptr.read_unaligned() };
-                            
-                            let mac_str = format!(
-                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                event.src_mac[0], event.src_mac[1], event.src_mac[2],
-                                event.src_mac[3], event.src_mac[4], event.src_mac[5]
-                            );
+                    let mut guard = match async_buf.readable_mut().await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("[ERROR] AsyncFd read error: {}", e);
+                            break;
+                        }
+                    };
 
-                            let (ip_str, proto_str) = match event.ip_version {
-                                4 => {
-                                    let ip = Ipv4Addr::new(event.src_ip[0], event.src_ip[1], event.src_ip[2], event.src_ip[3]);
-                                    let proto = match event.protocol {
-                                        6 => "TCP",
-                                        17 => "UDP",
-                                        1 => "ICMP",
-                                        _ => "OTHER",
-                                    };
-                                    (ip.to_string(), proto)
-                                }
-                                6 => {
-                                    let ip = Ipv6Addr::from(event.src_ip);
-                                    let proto = match event.protocol {
-                                        6 => "TCP",
-                                        17 => "UDP",
-                                        58 => "ICMPv6",
-                                        _ => "OTHER",
-                                    };
-                                    (ip.to_string(), proto)
-                                }
-                                _ => {
-                                    let proto = if event.protocol == 20 { "ARP" } else { "RAW" };
-                                    ("L2-FRAME".to_string(), proto)
-                                }
-                            };
+                    guard.get_inner_mut().for_each(|event| {
+                        match event {
+                            aya::maps::perf::PerfEvent::Sample { head, tail } => {
+                                let event = unsafe {
+                                    if tail.is_empty() {
+                                        let ptr = head.as_ptr() as *const MitigationEvent;
+                                        ptr.read_unaligned()
+                                    } else {
+                                        let mut temp = [0u8; std::mem::size_of::<MitigationEvent>()];
+                                        let head_len = head.len().min(temp.len());
+                                        temp[..head_len].copy_from_slice(&head[..head_len]);
+                                        if head_len < temp.len() {
+                                            let tail_len = tail.len().min(temp.len() - head_len);
+                                            temp[head_len..head_len + tail_len].copy_from_slice(&tail[..tail_len]);
+                                        }
+                                        let ptr = temp.as_ptr() as *const MitigationEvent;
+                                        ptr.read_unaligned()
+                                    }
+                                };
 
-                            let action_str = match event.action {
-                                1 => "DROP",
-                                2 => "BAN",
-                                _ => "UNKNOWN",
-                            };
+                                let mac_str = format!(
+                                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                    event.src_mac[0], event.src_mac[1], event.src_mac[2],
+                                    event.src_mac[3], event.src_mac[4], event.src_mac[5]
+                                );
 
-                            let alert_msg = format!(
-                                "[ALERT] MAC: {} | Src: {} -> Port: {} | Proto: {} | Action: {}",
-                                mac_str, ip_str, event.dest_port, proto_str, action_str
-                            );
+                                let (ip_str, proto_str) = match event.ip_version {
+                                    4 => {
+                                        let ip = Ipv4Addr::new(event.src_ip[0], event.src_ip[1], event.src_ip[2], event.src_ip[3]);
+                                        let proto = match event.protocol {
+                                            6 => "TCP",
+                                            17 => "UDP",
+                                            1 => "ICMP",
+                                            _ => "OTHER",
+                                        };
+                                        (ip.to_string(), proto)
+                                    }
+                                    6 => {
+                                        let ip = Ipv6Addr::from(event.src_ip);
+                                        let proto = match event.protocol {
+                                            6 => "TCP",
+                                            17 => "UDP",
+                                            58 => "ICMPv6",
+                                            _ => "OTHER",
+                                        };
+                                        (ip.to_string(), proto)
+                                    }
+                                    _ => {
+                                        let proto = if event.protocol == 20 { "ARP" } else { "RAW" };
+                                        ("L2-FRAME".to_string(), proto)
+                                    }
+                                };
 
-                            // Add to TUI alerts queue
-                            {
-                                let mut alerts = recent_alerts_local.lock().await;
-                                alerts.push_back(alert_msg.clone());
-                                if alerts.len() > 10 {
-                                    alerts.pop_front();
+                                let action_str = match event.action {
+                                    1 => "DROP",
+                                    2 => "BAN",
+                                    _ => "UNKNOWN",
+                                };
+
+                                let alert_msg = format!(
+                                    "[ALERT] MAC: {} | Src: {} -> Port: {} | Proto: {} | Action: {}",
+                                    mac_str, ip_str, event.dest_port, proto_str, action_str
+                                );
+
+                                // Add to TUI alerts queue
+                                {
+                                    let recent_alerts_local = Arc::clone(&recent_alerts_local);
+                                    let alert_msg = alert_msg.clone();
+                                    tokio::spawn(async move {
+                                        let mut alerts = recent_alerts_local.lock().await;
+                                        alerts.push_back(alert_msg);
+                                        if alerts.len() > 10 {
+                                            alerts.pop_front();
+                                        }
+                                    });
                                 }
+
+                                // Write to JSON log file
+                                let log_entry = format!(
+                                    "{{\"timestamp\":\"{}\",\"mac\":\"{}\",\"src\":\"{}\",\"dest_port\":{},\"protocol\":\"{}\",\"action\":\"{}\",\"ip_version\":{}}}\n",
+                                    get_timestamp(), mac_str, ip_str, event.dest_port, proto_str, action_str, event.ip_version
+                                );
+                                let log_tx_local = log_tx_local.clone();
+                                tokio::spawn(async move {
+                                    let _ = log_tx_local.send(log_entry).await;
+                                });
                             }
-
-                            // Write to JSON log file
-                            let log_entry = format!(
-                                "{{\"timestamp\":{},\"mac\":\"{}\",\"src\":\"{}\",\"dest_port\":{},\"protocol\":\"{}\",\"action\":\"{}\",\"ip_version\":{}}}\n",
-                                get_timestamp(), mac_str, ip_str, event.dest_port, proto_str, action_str, event.ip_version
-                            );
-                            if let mut file_guard = log_writer_local.lock().await {
-                                let _ = file_guard.write_all(log_entry.as_bytes()).await;
+                            aya::maps::perf::PerfEvent::Lost { count } => {
+                                let alert_msg = format!(
+                                    "[WARN] Lost {} mitigation events due to ring buffer overflow.",
+                                    count
+                                );
+                                {
+                                    let recent_alerts_local = Arc::clone(&recent_alerts_local);
+                                    let alert_msg = alert_msg.clone();
+                                    tokio::spawn(async move {
+                                        let mut alerts = recent_alerts_local.lock().await;
+                                        alerts.push_back(alert_msg);
+                                        if alerts.len() > 10 {
+                                            alerts.pop_front();
+                                        }
+                                    });
+                                }
                             }
                         }
-                    } else {
-                        sleep(Duration::from_millis(50)).await;
-                    }
+                    });
+
+                    guard.clear_ready();
                 }
             });
         }
     }
 
+    let bpf = Arc::new(Mutex::new(bpf));
+    let bpf_clone = Arc::clone(&bpf);
+
     // Main Control & TUI update thread
+    let gw_ip_clone = gw_ip_opt.clone();
     tokio::spawn(async move {
         let mut alert_active = false;
         let mut cooldown_seconds = 0;
         let mut last_pkt_count: u64 = 0;
         let mut last_drop_count: u64 = 0;
+        let mut gateway_mac_resolved = gateway_mac_resolved;
 
         loop {
             sleep(Duration::from_secs(1)).await;
             
             let mut total_pps: u64 = 0;
             let mut total_dps: u64 = 0;
-            
-            // Read Global Stats
-            if let Some(map) = bpf.map_mut("G_STATS") {
-                if let Ok(g_stats) = PerCpuArray::<_, GlobalStats>::try_from(map) {
-                    if let Ok(vals) = g_stats.get(&0, 0) {
-                        let mut current_pkt: u64 = 0;
-                        let mut current_drop: u64 = 0;
-                        for cpu_val in vals.iter() {
-                            current_pkt += cpu_val.pkt_count;
-                            current_drop += cpu_val.drop_count;
-                        }
-                        
-                        total_pps = current_pkt.saturating_sub(last_pkt_count);
-                        total_dps = current_drop.saturating_sub(last_drop_count);
-                        last_pkt_count = current_pkt;
-                        last_drop_count = current_drop;
-                    }
-                }
-            }
-
-            // Retrieve Active IPv4, IPv6, and MAC Bans
             let mut active_ipv4_bans = Vec::new();
             let mut active_ipv6_bans = Vec::new();
             let mut active_mac_bans = Vec::new();
-            let mono_now = get_monotonic_ns();
 
-            if let Some(map) = bpf.map_mut("BLACKLIST") {
-                if let Ok(blacklist) = HashMap::<_, u32, u64>::try_from(map) {
-                    for item in blacklist.iter() {
-                        if let Ok((ip_raw, expiry)) = item {
-                            let src_ip = Ipv4Addr::from(ip_raw.to_be());
-                            if expiry > mono_now {
-                                active_ipv4_bans.push((src_ip, (expiry - mono_now) / 1_000_000_000));
+            {
+                let mut bpf_guard = bpf_clone.lock().await;
+
+                // Gateway MAC polling if not resolved
+                if !gateway_mac_resolved {
+                    if let Some(ref gw_ip) = gw_ip_clone {
+                        if let Some(gw_mac) = get_mac_for_ip(gw_ip) {
+                            if let Some(map) = bpf_guard.map_mut("VIP_LIST_MAC") {
+                                if let Ok(mut vip_macs) = HashMap::<_, [u8; 6], u32>::try_from(map) {
+                                    let _ = vip_macs.insert(gw_mac, 1, 0);
+                                    gateway_mac_resolved = true;
+                                }
                             }
                         }
                     }
                 }
-            }
+                
+                // Read Global Stats
+                if let Some(map) = bpf_guard.map_mut("G_STATS") {
+                    if let Ok(g_stats) = PerCpuArray::<_, GlobalStats>::try_from(map) {
+                        if let Ok(per_cpu_vals) = g_stats.get(&0, 0) {
+                            let mut current_pkt: u64 = 0;
+                            let mut current_drop: u64 = 0;
+                            for cpu_val in per_cpu_vals.iter() {
+                                current_pkt += cpu_val.pkt_count;
+                                current_drop += cpu_val.drop_count;
+                            }
+                            total_pps = current_pkt.saturating_sub(last_pkt_count);
+                            total_dps = current_drop.saturating_sub(last_drop_count);
+                            last_pkt_count = current_pkt;
+                            last_drop_count = current_drop;
+                        }
+                    }
+                }
 
-            if let Some(map) = bpf.map_mut("BLACKLIST_V6") {
-                if let Ok(blacklist) = HashMap::<_, [u8; 16], u64>::try_from(map) {
-                    for item in blacklist.iter() {
-                        if let Ok((ip_raw, expiry)) = item {
-                            let src_ip = Ipv6Addr::from(ip_raw);
-                            if expiry > mono_now {
-                                active_ipv6_bans.push((src_ip, (expiry - mono_now) / 1_000_000_000));
+                let mono_now = get_monotonic_ns();
+
+                if let Some(map) = bpf_guard.map_mut("BLACKLIST") {
+                    if let Ok(blacklist) = HashMap::<_, u32, u64>::try_from(map) {
+                        for item in blacklist.iter() {
+                            if let Ok((ip_raw, expiry)) = item {
+                                let src_ip = Ipv4Addr::from(ip_raw.to_be());
+                                if expiry > mono_now {
+                                    active_ipv4_bans.push((src_ip, (expiry - mono_now) / 1_000_000_000));
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            if let Some(map) = bpf.map_mut("BLACKLIST_MAC") {
-                if let Ok(blacklist) = HashMap::<_, [u8; 6], u64>::try_from(map) {
-                    for item in blacklist.iter() {
-                        if let Ok((mac_raw, expiry)) = item {
-                            let mac_str = format!(
-                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                mac_raw[0], mac_raw[1], mac_raw[2],
-                                mac_raw[3], mac_raw[4], mac_raw[5]
-                            );
-                            if expiry > mono_now {
-                                active_mac_bans.push((mac_str, (expiry - mono_now) / 1_000_000_000));
+                if let Some(map) = bpf_guard.map_mut("BLACKLIST_V6") {
+                    if let Ok(blacklist) = HashMap::<_, [u8; 16], u64>::try_from(map) {
+                        for item in blacklist.iter() {
+                            if let Ok((ip_raw, expiry)) = item {
+                                let src_ip = Ipv6Addr::from(ip_raw);
+                                if expiry > mono_now {
+                                    active_ipv6_bans.push((src_ip, (expiry - mono_now) / 1_000_000_000));
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Auto-detect panic mode thresholds
-            if total_pps > config.global_alert_pps {
-                if !alert_active {
-                    alert_active = true;
-                    if let Some(map) = bpf.map_mut("G_CONFIG") {
-                        if let Ok(mut g_conf) = Array::<_, GlobalConfig>::try_from(map) {
-                            let _ = g_conf.set(0, GlobalConfig {
-                                alert_mode: 1,
-                                normal_mode_limit: config.normal_mode_limit,
-                                panic_mode_limit: config.panic_mode_limit,
-                                ban_duration_sec: config.ban_duration_sec,
-                                arp_mode_limit: config.arp_mode_limit,
-                                mac_mode_limit: config.mac_mode_limit,
-                            }, 0);
+                if let Some(map) = bpf_guard.map_mut("BLACKLIST_MAC") {
+                    if let Ok(blacklist) = HashMap::<_, [u8; 6], u64>::try_from(map) {
+                        for item in blacklist.iter() {
+                            if let Ok((mac_raw, expiry)) = item {
+                                let mac_str = format!(
+                                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                    mac_raw[0], mac_raw[1], mac_raw[2],
+                                    mac_raw[3], mac_raw[4], mac_raw[5]
+                                );
+                                if expiry > mono_now {
+                                    active_mac_bans.push((mac_str, (expiry - mono_now) / 1_000_000_000));
+                                }
+                            }
                         }
                     }
                 }
-                cooldown_seconds = 10;
-            } else if alert_active {
-                if total_pps < (config.global_alert_pps * 8 / 10) {
-                    if cooldown_seconds > 0 {
-                        cooldown_seconds -= 1;
-                    } else {
-                        alert_active = false;
-                        if let Some(map) = bpf.map_mut("G_CONFIG") {
+
+                // Auto-detect panic mode thresholds
+                if total_pps > config.global_alert_pps {
+                    if !alert_active {
+                        alert_active = true;
+                        if let Some(map) = bpf_guard.map_mut("G_CONFIG") {
                             if let Ok(mut g_conf) = Array::<_, GlobalConfig>::try_from(map) {
                                 let _ = g_conf.set(0, GlobalConfig {
-                                    alert_mode: 0,
+                                    alert_mode: 1,
                                     normal_mode_limit: config.normal_mode_limit,
                                     panic_mode_limit: config.panic_mode_limit,
+                                    _padding: 0,
                                     ban_duration_sec: config.ban_duration_sec,
                                     arp_mode_limit: config.arp_mode_limit,
                                     mac_mode_limit: config.mac_mode_limit,
@@ -406,8 +503,30 @@ async fn main() -> Result<(), anyhow::Error> {
                             }
                         }
                     }
-                } else {
                     cooldown_seconds = 10;
+                } else if alert_active {
+                    if total_pps < (config.global_alert_pps * 8 / 10) {
+                        if cooldown_seconds > 0 {
+                            cooldown_seconds -= 1;
+                        } else {
+                            alert_active = false;
+                            if let Some(map) = bpf_guard.map_mut("G_CONFIG") {
+                                if let Ok(mut g_conf) = Array::<_, GlobalConfig>::try_from(map) {
+                                    let _ = g_conf.set(0, GlobalConfig {
+                                        alert_mode: 0,
+                                        normal_mode_limit: config.normal_mode_limit,
+                                        panic_mode_limit: config.panic_mode_limit,
+                                        _padding: 0,
+                                        ban_duration_sec: config.ban_duration_sec,
+                                        arp_mode_limit: config.arp_mode_limit,
+                                        mac_mode_limit: config.mac_mode_limit,
+                                    }, 0);
+                                }
+                            }
+                        }
+                    } else {
+                        cooldown_seconds = 10;
+                    }
                 }
             }
 
@@ -505,5 +624,39 @@ async fn main() -> Result<(), anyhow::Error> {
 
     signal::ctrl_c().await?;
     println!("\n[NYX] Shutting down L2/L3/L4 Apex Shield. Restoring defaults.");
+
+    // Clean up blacklist maps on exit to prevent stale bans on restart
+    {
+        let mut bpf_guard = bpf.lock().await;
+        
+        if let Some(map) = bpf_guard.map_mut("BLACKLIST") {
+            if let Ok(mut blacklist) = HashMap::<_, u32, u64>::try_from(map) {
+                let keys: Vec<u32> = blacklist.iter().filter_map(|r| r.ok().map(|(k, _)| k)).collect();
+                for key in keys {
+                    let _ = blacklist.remove(&key);
+                }
+            }
+        }
+        
+        if let Some(map) = bpf_guard.map_mut("BLACKLIST_V6") {
+            if let Ok(mut blacklist_v6) = HashMap::<_, [u8; 16], u64>::try_from(map) {
+                let keys: Vec<[u8; 16]> = blacklist_v6.iter().filter_map(|r| r.ok().map(|(k, _)| k)).collect();
+                for key in keys {
+                    let _ = blacklist_v6.remove(&key);
+                }
+            }
+        }
+        
+        if let Some(map) = bpf_guard.map_mut("BLACKLIST_MAC") {
+            if let Ok(mut blacklist_mac) = HashMap::<_, [u8; 6], u64>::try_from(map) {
+                let keys: Vec<[u8; 6]> = blacklist_mac.iter().filter_map(|r| r.ok().map(|(k, _)| k)).collect();
+                for key in keys {
+                    let _ = blacklist_mac.remove(&key);
+                }
+            }
+        }
+        println!("[INFO] Kernel blacklist maps cleared successfully.");
+    }
+    
     Ok(())
 }
