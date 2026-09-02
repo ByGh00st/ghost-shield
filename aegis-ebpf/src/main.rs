@@ -228,19 +228,45 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
             }
         }
 
-        // L4 Destination Port Parsing
+        // L4 Destination Port Parsing & Deep Protocol Sanity Inspection
         let mut dest_port: u16 = 0;
         if protocol == 6 {
             let tcp_offset = 14 + ihl;
             if s + tcp_offset + 20 <= e {
                 let tcp = (s + tcp_offset) as *const tcphdr;
                 dest_port = u16::from_be(unsafe { (*tcp).dest });
+
+                // Advanced TCP Flag Sanity Check (Immunity to Scans & Broken Handshakes)
+                let tcp_flags_byte = unsafe { *((s + tcp_offset + 13) as *const u8) };
+                // 1. TCP NULL Scan (Flags == 0)
+                if tcp_flags_byte == 0 {
+                    return drop_and_count();
+                }
+                // 2. TCP SYN+FIN Scan (0x01 | 0x02 == 0x03)
+                if (tcp_flags_byte & 0x03) == 0x03 {
+                    return drop_and_count();
+                }
+                // 3. TCP SYN+RST Invalid Handshake (0x02 | 0x04 == 0x06)
+                if (tcp_flags_byte & 0x06) == 0x06 {
+                    return drop_and_count();
+                }
+                // 4. TCP XMAS Scan (FIN | PSH | URG == 0x29)
+                if (tcp_flags_byte & 0x29) == 0x29 {
+                    return drop_and_count();
+                }
             }
         } else if protocol == 17 {
             let udp_offset = 14 + ihl;
             if s + udp_offset + 8 <= e {
                 let udp = (s + udp_offset) as *const udphdr;
+                let src_port = u16::from_be(unsafe { (*udp).source });
                 dest_port = u16::from_be(unsafe { (*udp).dest });
+                let udp_len = u16::from_be(unsafe { (*udp).len });
+
+                // Reflection Amplification Defense (DNS: 53, NTP: 123, SSDP: 1900, CLDAP: 389, Memcached: 11211)
+                if (src_port == 53 || src_port == 123 || src_port == 1900 || src_port == 389 || src_port == 11211) && udp_len > 256 {
+                    return drop_and_count();
+                }
             }
         }
 
@@ -317,19 +343,33 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
             }
         }
 
-        // L4 Destination Port Parsing
+        // L4 Destination Port Parsing & Deep Protocol Sanity Inspection
         let mut dest_port: u16 = 0;
         if protocol == 6 {
             let tcp_offset = next_hdr_offset;
             if s + tcp_offset + 20 <= e {
                 let tcp = (s + tcp_offset) as *const tcphdr;
                 dest_port = u16::from_be(unsafe { (*tcp).dest });
+
+                let tcp_flags_byte = unsafe { *((s + tcp_offset + 13) as *const u8) };
+                if tcp_flags_byte == 0 
+                    || (tcp_flags_byte & 0x03) == 0x03 
+                    || (tcp_flags_byte & 0x06) == 0x06 
+                    || (tcp_flags_byte & 0x29) == 0x29 {
+                    return drop_and_count();
+                }
             }
         } else if protocol == 17 {
             let udp_offset = next_hdr_offset;
             if s + udp_offset + 8 <= e {
                 let udp = (s + udp_offset) as *const udphdr;
+                let src_port = u16::from_be(unsafe { (*udp).source });
                 dest_port = u16::from_be(unsafe { (*udp).dest });
+                let udp_len = u16::from_be(unsafe { (*udp).len });
+
+                if (src_port == 53 || src_port == 123 || src_port == 1900 || src_port == 389 || src_port == 11211) && udp_len > 256 {
+                    return drop_and_count();
+                }
             }
         }
 
