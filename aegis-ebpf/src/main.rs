@@ -281,7 +281,7 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
             } else {
                 st.tokens = new_tokens as u32;
                 st.last_ts = now;
-                let ban_expiry = now + ban_duration_ns;
+                let ban_expiry = now.saturating_add(ban_duration_ns);
                 unsafe { let _ = BLACKLIST.insert(&src_ip, &ban_expiry, 0); }
                 let mut event_ip = [0u8; 16];
                 event_ip[0..4].copy_from_slice(&src_be.to_ne_bytes());
@@ -384,7 +384,7 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
             } else {
                 st.tokens = new_tokens as u32;
                 st.last_ts = now;
-                let ban_expiry = now + ban_duration_ns;
+                let ban_expiry = now.saturating_add(ban_duration_ns);
                 unsafe { let _ = BLACKLIST_V6.insert(&src_ip6, &ban_expiry, 0); }
                 let event = MitigationEvent {
                     src_ip: src_ip6,
