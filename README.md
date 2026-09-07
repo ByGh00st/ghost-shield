@@ -35,7 +35,6 @@ Aegis/Hydra, **eBPF (Extended Berkeley Packet Filter)** ve **XDP (eXpress Data P
 - ✅ **TCP Flag Sanity Engine**: NULL, SYN-FIN, SYN-RST, XMAS sızma taramalarına anında XDP_DROP
 - ✅ **UDP Amplification Kalkanı**: DNS (53), NTP (123), SSDP (1900), CLDAP (389), Memcached (11211) yansıtma filtreleme
 - ✅ **Anti-Poisoning VIP Kilidi**: Yetkisiz self-whitelisting girişimlerine anında 24 saatlik XDP_DROP karşı saldırısı
-- ✅ **Medusa-Prime Çapraz Katman Entegrasyonu**: Ring -1 bal küpü hipervizörüyle canlı IPC köprüsü ve otomatik ban
 - ✅ **Web C2 & Derin IP İstihbaratı**: Milisaniyelik canlı arama çubuğu, GET vs POST analitiği ve taranan URI haritası
 - ✅ **Dinamik Mod Geçişi**: Normal/Panik modu otomatik adaptasyonu
 - ✅ **Zero-Copy Architecture**: Bellek kopyalama maliyeti yoktur
