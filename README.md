@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ Aegis / Hydra: Kernel-Level L2/L3/L4 WAF & IPS
+# 🛡️ Aegis / Hydra: Kernel-Level L2/L3/L4 XDP IPS & DDoS Shield
 
 > **"In the arena of packets, there is no honor, only survivors."** — Nyx Protocol
 
@@ -31,7 +31,8 @@ Aegis/Hydra, **eBPF (Extended Berkeley Packet Filter)** ve **XDP (eXpress Data P
 - ✅ **Kernel-Level Processing**: XDP/eBPF ile Ring 0'da paket işleme
 - ✅ **Volumetrik DDoS Koruması**: Milyarda paket/saniye düzeyinde saldırılara karşı dayanıklı
 - ✅ **Dual-Stack Support**: IPv4 ve IPv6 eş zamanlı destekleme
-- ✅ **L2/L3/L4 Analiz**: Ethernet, IP, ARP, TCP, UDP derinlemesine inspeksiyonu
+- ✅ **L2/L3/L4 Analiz & VLAN Soyma**: Ethernet, 802.1Q/802.1ad (QinQ), IPv4/IPv6 (Extension Headers), ARP, TCP, UDP derinlemesine inspeksiyonu
+- ✅ **GCRA & Anti-Spoof Koruması**: Tamsayı kesme hatasız nanosaniye hassasiyetli GCRA algoritması ve sahte TCP SYN kaynaklarına karşı durumsuz (stateless) koruma
 - ✅ **Dinamik Mod Geçişi**: Normal/Panik modu otomatik adaptasyonu
 - ✅ **Zero-Copy Architecture**: Bellek kopyalama maliyeti yoktur
 - ✅ **LRU Bellek Yönetimi**: Memory exhaustion'a karşı koruma
@@ -67,7 +68,7 @@ Aegis/Hydra, **eBPF (Extended Berkeley Packet Filter)** ve **XDP (eXpress Data P
 
 ```bash
 # Repository'yi klonla
-git clone https://github.com/byghost-tr/ghost-shield.git
+git clone https://github.com/ByGh00st/ghost-shield.git
 cd ghost-shield
 
 # Bağımlılıkları yükle (Ubuntu/Debian)
@@ -232,15 +233,16 @@ Ağ kartına bir Ethernet çerçevesi (Ethernet Frame) girdiğinde sırasıyla �
 
 | Harita | Tipi | Anahtar | Değer | Açıklama |
 | :--- | :--- | :--- | :--- | :--- |
-| `VIP_LIST` | LPM_TRIE | CIDR (IPv4) | Flag | Whitelist IPv4 Blokları |
-| `VIP_LIST_V6` | LPM_TRIE | CIDR (IPv6) | Flag | Whitelist IPv6 Blokları |
-| `VIP_LIST_MAC` | LRU_HASH | MAC | Flag | Gateway MAC Whitelisti |
+| `VIP_LIST` | LPM_TRIE | CIDR (IPv4) | Flag | Whitelist IPv4 Blokları & Gateway |
+| `VIP_LIST_V6` | LPM_TRIE | CIDR (IPv6) | Flag | Whitelist IPv6 Blokları & Gateway |
+| `VIP_LIST_MAC` | LRU_HASH | MAC | Flag | IPv4/IPv6 Gateway & VRRP Router MAC Whitelisti |
 | `BLACKLIST` | LRU_HASH | IP (IPv4) | Bitiş TS | Ban Listesi (IPv4) |
 | `BLACKLIST_V6` | LRU_HASH | IPv6 | Bitiş TS | Ban Listesi (IPv6) |
 | `BLACKLIST_MAC` | LRU_HASH | MAC | Bitiş TS | Ban Listesi (MAC) |
-| `G_CONFIG` | ARRAY | Index 0 | GlobalConfig | Dinamik Ayarlar |
-| `G_STATS` | PERCPU_ARRAY | Index 0 | Stats | Global İstatistikler |
-| `EVENTS` | PERF_EVENT | CPU ID | Event | Ban Olayları |
+| `TRAFFIC` / `_V6` / `_MAC` / `_ARP` | LRU_HASH | IP / MAC | `GcraState` | Nanosaniye Hassasiyetli GCRA & İhlal Sayacı |
+| `G_CONFIG` | ARRAY | Index 0 | `GlobalConfig` | Ön-Hesaplanmış GCRA Aralıkları & Dinamik Ayarlar |
+| `G_STATS` | PERCPU_ARRAY | Index 0 | `GlobalStats` | Protokol Bazlı Global İstatistikler |
+| `EVENTS` | RINGBUF | — (256 KiB) | `MitigationEvent` | Sıfır Kopyalı Paylaşımlı Olay Halkası |
 
 **Neden LRU Hashmap?** DDoS saldırılarında milyonlarca spoofed IP adresi kullanılabilir. LRU, bellek dolduğunda eski kayıtları otomatik silarak bellek doluluğunu engeller.
 
@@ -283,19 +285,23 @@ Performans değerleri teorik hesaplamalar ve XDP literatürüne dayanmaktadır. 
     "normal_mode_limit": 2000,
     "ban_duration_sec": 300,
     "arp_mode_limit": 50,
-    "mac_mode_limit": 6000
+    "mac_mode_limit": 6000,
+    "ban_strike_threshold": 32,
+    "spoof_protection": true
 }
 ```
 
 | Parametre | Açıklama |
 | :--- | :--- |
-| `checkers` | WAF bypass edecek IP/CIDR adresleri |
+| `checkers` | IPS bypass edecek IP/CIDR adresleri |
 | `global_alert_pps` | Panik modunu tetikleyen toplam PPS |
 | `panic_mode_limit` | Panik modda IP başına PPS limiti |
 | `normal_mode_limit` | Normal modda IP başına PPS limiti |
 | `ban_duration_sec` | Ban süresi (saniye) |
 | `arp_mode_limit` | MAC başına ARP PPS limiti |
 | `mac_mode_limit` | MAC başına L2 PPS limiti |
+| `ban_strike_threshold` | Burst sonrası kalıcı ban öncesi gereken ardışık ihlal sayısı |
+| `spoof_protection` | Sahte TCP SYN saldırılarında meşru IP karalamayı önleyen durumsuz düşürme kalkanı |
 
 ### Kullanım Senaryoları
 
@@ -420,7 +426,7 @@ sudo sysctl -p
 <a id="test-senaryoları"></a>
 ## Test Senaryoları 🧪
 
-`test_flood.py` aracıyla saldırı simülasyonu yapabilirsiniz:
+`test_flood.py` doğrulama aracı yalnızca yetkili yerel/laboratuvar ağlarında (`127.0.0.0/8`, `::1`, `RFC 1918` özel alt ağları ve `RFC 5737` dokümantasyon blokları) çalışacak şekilde sert sınırlandırılmıştır (`TTL=1`, maks. `30s` / sınırlı paket kotası); genel (public/WAN) IP hedeflerini soket açmadan reddeder:
 
 ### UDPv4 Flood
 ```bash

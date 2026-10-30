@@ -11,5 +11,7 @@
     "normal_mode_limit": 2000,
     "ban_duration_sec": 300,
     "arp_mode_limit": 50,
-    "mac_mode_limit": 6000
+    "mac_mode_limit": 6000,
+    "ban_strike_threshold": 32,
+    "spoof_protection": true
 }

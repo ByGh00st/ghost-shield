@@ -1,10 +1,10 @@
 [package]
 name = "aegis-common"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-aya = { git = "https://github.com/aya-rs/aya", optional = true }
+aya = { git = "https://github.com/aya-rs/aya", rev = "f3b8dd6d4c856753ab6a6db644232f6280d8e8a2", optional = true }
 
 [features]
 user = ["dep:aya"]

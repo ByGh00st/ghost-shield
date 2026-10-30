@@ -1,10 +1,10 @@
 [package]
 name = "aegis-ebpf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/aya-rs/aya" }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "f3b8dd6d4c856753ab6a6db644232f6280d8e8a2" }
 aegis-common = { path = "../aegis-common" }
 
 [[bin]]
@@ -12,6 +12,4 @@ name = "aegis"
 path = "src/main.rs"
 
 [lints.rust]
-linker-messages = "allow"
-
-
+linker_messages = "allow"
