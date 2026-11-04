@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 64-byte sentinel written to `OUT_DIR/aegis-ebpf.bin` when host `cargo check` runs
 /// before the `bpfel-unknown-none` kernel artifact has been built.
