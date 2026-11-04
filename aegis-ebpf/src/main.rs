@@ -18,6 +18,10 @@ use aya_ebpf::{
 #[link_section = ".nyx_apex"]
 pub static NYX_APEX: [u8; 7] = *b"ByGhost";
 
+#[no_mangle]
+#[link_section = "license"]
+pub static LICENSE: [u8; 4] = *b"GPL\0";
+
 // ============================================================================
 // Wire-Format Protocol Headers (`packed`, align = 1, read via `read_unaligned`)
 // ============================================================================
