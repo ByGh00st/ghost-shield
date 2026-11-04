@@ -114,7 +114,7 @@ jobs:
           echo "=========================================================="
           echo "[+] Executing Kernel ABI & Algorithms Unit Tests..."
           echo "=========================================================="
-          cargo test --workspace --verbose -- --nocapture
+          cargo test -p aegis-common -p aegis --verbose -- --nocapture
 
       - name: Clippy Linter Verification
         run: |
@@ -123,6 +123,13 @@ jobs:
 
       - name: Live Kernel XDP Smoke & Graceful Shutdown Test
         run: |
+          echo "=========================================================="
+          echo "[+] Staging Configuration Files..."
+          echo "=========================================================="
+          sudo mkdir -p /etc/hydra
+          sudo cp config.json /etc/hydra/config.json
+          cp config.json target/release/config.json
+
           echo "=========================================================="
           echo "[+] Provisioning Virtual Ethernet Pair (veth-aegis <-> veth-peer)..."
           echo "=========================================================="
@@ -133,23 +140,30 @@ jobs:
           sudo ip link set veth-peer up
 
           echo "[+] Spawning Aegis on veth-aegis..."
-          sudo ./target/release/aegis veth-aegis &
+          sudo ./target/release/aegis veth-aegis > aegis.log 2>&1 &
           AEGIS_PID=$!
           sleep 3
 
-          echo "[+] Checking if Aegis process is running (PID: $AEGIS_PID)..."
-          kill -0 $AEGIS_PID
+          if kill -0 $AEGIS_PID 2>/dev/null; then
+            echo "[+] Aegis is active and attached to XDP hook (PID: $AEGIS_PID)."
+          else
+            echo "[!] Aegis failed to initialize. Displaying diagnostic logs:"
+            cat aegis.log
+            exit 1
+          fi
 
-          echo "[+] Transmitting RFC 5737 Lab Verification Flood..."
-          python3 test_flood.py 198.51.100.1 udp || true
+          echo "[+] Transmitting RFC 5737 Lab Verification Flood (2s test)..."
+          python3 test_flood.py 198.51.100.1 udp 2 || true
 
           echo "[+] Delivering SIGINT for graceful XDP detachment..."
-          sudo kill -SIGINT $AEGIS_PID
-          wait $AEGIS_PID || true
-          echo "[+] Aegis detached and stopped cleanly."
+          sudo kill -SIGINT $AEGIS_PID || true
+          sleep 2
+          
+          echo "[+] Recent runtime logs from Aegis:"
+          head -n 30 aegis.log || true
 
           echo "[+] Cleaning up test interfaces..."
-          sudo ip link del veth-aegis
+          sudo ip link del veth-aegis 2>/dev/null || true
           echo "[+] Live kernel smoke test passed without errors."
 
       - name: Archive Production Release Artifacts

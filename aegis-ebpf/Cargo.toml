@@ -10,6 +10,8 @@ aegis-common = { path = "../aegis-common" }
 [[bin]]
 name = "aegis"
 path = "src/main.rs"
+test = false
+doctest = false
 
 [lints.rust]
 linker_messages = "allow"

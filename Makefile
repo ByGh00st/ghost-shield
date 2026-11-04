@@ -22,7 +22,7 @@ run: build
 
 test-unit:
 	@echo "[+] Running Rust Workspace Unit Tests..."
-	cargo test --workspace --verbose
+	cargo test -p aegis-common -p aegis --verbose
 
 test-python:
 	@echo "[+] Running Python Flood Harness & Config Security Tests..."

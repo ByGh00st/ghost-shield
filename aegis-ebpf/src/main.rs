@@ -753,6 +753,7 @@ pub fn apex_shield(ctx: XdpContext) -> u32 {
     xdp_action::XDP_PASS
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
