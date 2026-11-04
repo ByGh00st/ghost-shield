@@ -4,6 +4,12 @@
 
 > **"In the arena of packets, there is no honor, only survivors."** — Nyx Protocol
 
+[![CI / Kernel & Control Plane Verification](https://github.com/ByGh00st/ghost-shield/actions/workflows/ci.yml/badge.svg)](https://github.com/ByGh00st/ghost-shield/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-8%2F8%20Passed-brightgreen?style=flat&logo=rust)](https://github.com/ByGh00st/ghost-shield/actions/workflows/ci.yml)
+[![Python Harness](https://img.shields.io/badge/Harness%20Tests-5%2F5%20Passed-blue?style=flat&logo=python)](https://github.com/ByGh00st/ghost-shield/actions/workflows/ci.yml)
+[![eBPF Kernel](https://img.shields.io/badge/eBPF-bpfel--unknown--none-orange?style=flat&logo=linux)](https://github.com/ByGh00st/ghost-shield)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 </div>
 
 Aegis/Hydra, **eBPF (Extended Berkeley Packet Filter)** ve **XDP (eXpress Data Path)** teknolojileri kullanılarak doğrudan Linux çekirdeğinin en alt ağ sürücü katmanında (Ring 0) çalışan, yüksek performanslı ve dinamik bir IPS/DDoS koruma motorudur.
@@ -424,7 +430,51 @@ sudo sysctl -p
 ---
 
 <a id="test-senaryoları"></a>
-## Test Senaryoları 🧪
+## Test Senaryoları & Otomatik CI/CD Doğrulama 🧪
+
+Proje, GitHub Actions üzerinde her push ve pull request işleminde hem çekirdek (Ring 0) eBPF derlemesini, hem userspace denetleyicisini, hem de birim ve entegrasyon testlerini tam otomatik olarak denetler.
+
+### 🤖 1. GitHub Actions CI Pipeline (`.github/workflows/ci.yml`)
+
+GitHub Actions ortamında (`ubuntu-latest`) otomatik olarak icra edilen aşamalar:
+
+1. **Syntax & Lint Audit**: `cargo fmt --check`, `start.sh` bash doğrulaması ve `config.json` şema denetimi.
+2. **Ring 0 eBPF Core Build**: `cargo +nightly build -p aegis-ebpf --target bpfel-unknown-none -Z build-std=core --release` ile derleme ve ELF magic header (`\x7fELF`) doğrulaması.
+3. **Ring 3 Apex Control Plane Build**: `cargo build -p aegis --release` ile ikili dosyanın derlenmesi.
+4. **Rust Unit Tests (8/8 Matrix)**:
+   - `aegis-common`:
+     * `abi_layouts_have_zero_implicit_padding`: C/Rust eBPF RingBuf ve Map yapılarının 0 bayt boşluk (padding) ile tam byte hizalanması.
+     * `gcra_eliminates_subquantum_truncation_starvation`: Tamsayı bölme hatasız nanosaniye hassasiyetli GCRA sızdıran kova doğrulaması.
+     * `gcra_stateless_syn_guard_drops_excess_without_blacklisting`: Sahte TCP SYN saldırılarında kara listeye almadan durumsuz drop mekanizması.
+     * `gcra_escalates_sustained_flood_to_ban_and_decays_after_quiet_window`: Kalıcı taşkınlarda çoklu grev (strike) eskalasyonu ve soğuma sönümlenmesi.
+   - `aegis`:
+     * `route_v4_parses_default_gateway_and_ignores_link_routes`: `/proc/net/route` üzerinden varsayılan ağ geçidinin çözümlenmesi.
+     * `route_v6_parses_default_nexthop`: `/proc/net/ipv6_route` üzerinden nexthop ayrıştırması.
+     * `arp_table_ignores_incomplete_and_multicast_entries`: Eksik / multicast ARP girişlerinin ayıklanması.
+     * `cidr_parser_canonicalizes_host_bits_and_rejects_overflow_prefixes`: CIDR host bitlerinin sıfırlanması ve sınır taşma koruması.
+5. **Python Test Harness Security Tests (5/5 Matrix)**:
+   - RFC 1071 checksum hesaplama doğrulaması.
+   - RFC 1918 / RFC 5737 yerel lab ağlarının kabulü.
+   - Public WAN IP adreslerinin (`8.8.8.8`, `1.1.1.1` vb.) soket açılmadan `PermissionError` ile sert bloklanması.
+6. **Live Kernel XDP Smoke Test**: Sanal Ethernet (`veth`) çifti üzerinde eBPF XDP hook'unun bağlanması, test problarının gönderilmesi ve `SIGINT` ile zarifçe (graceful) devreden çıkarılması.
+7. **Artifact Packaging**: Üretilen ikili dosyaların GitHub Actions üzerinden doğrudan indirilebilir hale getirilmesi.
+
+### 🧪 2. Yerel Birim ve Güvenlik Testlerini Çalıştırma
+
+Tüm testleri tek komutla yerel olarak icra etmek için:
+
+```bash
+# Tüm birim ve python harness testlerini koştur
+make test-all
+
+# Sadece Rust test matrisini koştur
+make test-unit
+
+# Sadece Python test harness güvenlik kontrollerini koştur
+make test-python
+```
+
+### ⚡ 3. Canlı Laboratuvar Flood Testleri (test_flood.py)
 
 `test_flood.py` doğrulama aracı yalnızca yetkili yerel/laboratuvar ağlarında (`127.0.0.0/8`, `::1`, `RFC 1918` özel alt ağları ve `RFC 5737` dokümantasyon blokları) çalışacak şekilde sert sınırlandırılmıştır (`TTL=1`, maks. `30s` / sınırlı paket kotası); genel (public/WAN) IP hedeflerini soket açmadan reddeder:
 

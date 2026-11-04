@@ -1,17 +1,17 @@
 #![no_std]
 #![no_main]
 
+use aegis_common::{
+    evaluate_gcra_raw, GcraState, GcraVerdict, GlobalConfig, GlobalStats, MitigationEvent,
+    ACTION_BAN, ACTION_DROP, DEFAULT_BURST_NS, EVENT_VER_ARP, EVENT_VER_IPV4, EVENT_VER_IPV6,
+    EVENT_VER_L2, PROTO_ARP, PROTO_L2_RAW, SYN_BURST_NS,
+};
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
     maps::{lpm_trie::Key, Array, LpmTrie, LruHashMap, PerCpuArray, RingBuf},
     programs::XdpContext,
-};
-use aegis_common::{
-    evaluate_gcra_raw, GcraState, GcraVerdict, GlobalConfig, GlobalStats, MitigationEvent,
-    ACTION_BAN, ACTION_DROP, DEFAULT_BURST_NS, EVENT_VER_ARP, EVENT_VER_IPV4, EVENT_VER_IPV6,
-    EVENT_VER_L2, PROTO_ARP, PROTO_L2_RAW, SYN_BURST_NS,
 };
 
 #[no_mangle]

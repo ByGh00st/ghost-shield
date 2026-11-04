@@ -5,3 +5,5 @@ Cargo.lock
 .vscode/
 .idea/
 *.out
+__pycache__/
+*.py[cod]

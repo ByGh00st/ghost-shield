@@ -156,7 +156,11 @@ pub unsafe fn evaluate_gcra_raw(
         };
     }
 
-    let threshold = if strike_threshold == 0 { 1 } else { strike_threshold };
+    let threshold = if strike_threshold == 0 {
+        1
+    } else {
+        strike_threshold
+    };
     if strikes >= threshold {
         unsafe {
             (&raw mut (*st).strikes).write_volatile(0);
@@ -232,7 +236,14 @@ mod tests {
         for i in 0..10_000 {
             now += gaps[i % 3];
             let verdict = unsafe {
-                evaluate_gcra_raw(&raw mut state, now, interval_ns, DEFAULT_BURST_NS, 32, false)
+                evaluate_gcra_raw(
+                    &raw mut state,
+                    now,
+                    interval_ns,
+                    DEFAULT_BURST_NS,
+                    32,
+                    false,
+                )
             };
             assert_eq!(verdict, GcraVerdict::Pass, "False positive at packet {}", i);
         }
@@ -262,12 +273,7 @@ mod tests {
             let v = unsafe {
                 evaluate_gcra_raw(&raw mut state, now, interval_ns, SYN_BURST_NS, 8, true)
             };
-            assert_eq!(
-                v,
-                GcraVerdict::DropOnly {
-                    emit_alert: i == 0
-                }
-            );
+            assert_eq!(v, GcraVerdict::DropOnly { emit_alert: i == 0 });
         }
     }
 
@@ -287,12 +293,7 @@ mod tests {
             let v = unsafe {
                 evaluate_gcra_raw(&raw mut state, now, interval_ns, DEFAULT_BURST_NS, 4, false)
             };
-            assert_eq!(
-                v,
-                GcraVerdict::DropOnly {
-                    emit_alert: i == 0
-                }
-            );
+            assert_eq!(v, GcraVerdict::DropOnly { emit_alert: i == 0 });
         }
 
         // Wait > 2s (STRIKE_DECAY_NS), advance `tat_ns` manually to simulate saturated bucket again

@@ -508,7 +508,12 @@ fn process_mitigation_event(
 
 async fn open_log_file() -> Result<(tokio::fs::File, PathBuf, u64), anyhow::Error> {
     let primary = PathBuf::from("/var/log/hydra_waf.log");
-    match OpenOptions::new().create(true).append(true).open(&primary).await {
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&primary)
+        .await
+    {
         Ok(f) => {
             let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
             Ok((f, primary, len))
@@ -575,7 +580,11 @@ async fn run_buffered_log_writer(
                     current_size = 0;
                 }
                 Err(e) => {
-                    eprintln!("[ERROR] Log rotation reopen failed for {}: {}", log_path.display(), e);
+                    eprintln!(
+                        "[ERROR] Log rotation reopen failed for {}: {}",
+                        log_path.display(),
+                        e
+                    );
                     return;
                 }
             }
@@ -598,7 +607,10 @@ async fn main() -> Result<(), anyhow::Error> {
     let config_content = if let Some(ref p) = exe_cfg {
         std::fs::read_to_string(p)
     } else {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no exe config"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no exe config",
+        ))
     }
     .or_else(|_| std::fs::read_to_string(Path::new("/etc/hydra/config.json")))
     .or_else(|_| std::fs::read_to_string(Path::new("config.json")))
@@ -625,7 +637,9 @@ async fn main() -> Result<(), anyhow::Error> {
         ));
     }
     if config.ban_duration_sec == 0 {
-        return Err(anyhow::anyhow!("Config error: ban_duration_sec cannot be 0"));
+        return Err(anyhow::anyhow!(
+            "Config error: ban_duration_sec cannot be 0"
+        ));
     }
     if config.arp_mode_limit == 0 || config.mac_mode_limit == 0 {
         return Err(anyhow::anyhow!(
@@ -693,12 +707,18 @@ async fn main() -> Result<(), anyhow::Error> {
         if let Some(gw4) = gw4_opt {
             let key = Key::new(32, gw4.octets());
             vip4_map.insert(&key, &1u32, 0)?;
-            println!("[INFO] Protected IPv4 Default Gateway in VIP_LIST: {}/32", gw4);
+            println!(
+                "[INFO] Protected IPv4 Default Gateway in VIP_LIST: {}/32",
+                gw4
+            );
         }
         if let Some(gw6) = gw6_opt {
             let key = Key::new(128, gw6.octets());
             vip6_map.insert(&key, &1u32, 0)?;
-            println!("[INFO] Protected IPv6 Default Gateway in VIP_LIST_V6: {}/128", gw6);
+            println!(
+                "[INFO] Protected IPv6 Default Gateway in VIP_LIST_V6: {}/128",
+                gw6
+            );
         }
     }
 
@@ -742,7 +762,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     dev, e
                 );
                 prog.attach(&dev_cstr, XdpMode::Skb).map_err(|e2| {
-                    anyhow::anyhow!("Failed to attach XDP in Skb fallback mode on '{}': {}", dev, e2)
+                    anyhow::anyhow!(
+                        "Failed to attach XDP in Skb fallback mode on '{}': {}",
+                        dev,
+                        e2
+                    )
                 })?;
                 println!(
                     "[INFO] Apex Shield attached to '{}' in Skb (Generic) fallback mode.",
@@ -773,15 +797,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
         tokio::spawn(async move {
             // SAFETY: `RingBuf<MapData>` owns a valid open fd for its entire lifetime and never swaps it.
-            let mut async_rb = match unsafe {
-                AsyncFd::register_with_interest(ring_buf, Interest::READABLE)
-            } {
-                Ok(fd) => fd,
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to register RingBuf with epoll reactor: {}", e);
-                    return;
-                }
-            };
+            let mut async_rb =
+                match unsafe { AsyncFd::register_with_interest(ring_buf, Interest::READABLE) } {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        eprintln!(
+                            "[ERROR] Failed to register RingBuf with epoll reactor: {}",
+                            e
+                        );
+                        return;
+                    }
+                };
 
             loop {
                 let mut guard = match async_rb.readable_mut().await {
@@ -830,10 +856,7 @@ async fn main() -> Result<(), anyhow::Error> {
             tick_counter = tick_counter.wrapping_add(1);
 
             let now_inst = Instant::now();
-            let dt = now_inst
-                .duration_since(last_tick)
-                .as_secs_f64()
-                .max(0.05);
+            let dt = now_inst.duration_since(last_tick).as_secs_f64().max(0.05);
             last_tick = now_inst;
             let mono_now = get_monotonic_ns();
 
@@ -941,7 +964,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     for mac in newly_discovered_macs {
                         if known_gw_macs.insert(mac) {
                             if let Some(map) = bpf_guard.map_mut("VIP_LIST_MAC") {
-                                if let Ok(mut vip_macs) = HashMap::<_, [u8; 6], u32>::try_from(map) {
+                                if let Ok(mut vip_macs) = HashMap::<_, [u8; 6], u32>::try_from(map)
+                                {
                                     let _ = vip_macs.insert(&mac, &1u32, 0);
                                 }
                             }
@@ -1021,12 +1045,11 @@ async fn main() -> Result<(), anyhow::Error> {
                                     as f64
                                     / dt)
                                     .round() as u64;
-                                malformed_pps = ((cur
-                                    .malformed_count
-                                    .wrapping_sub(prev_stats.malformed_count))
-                                    as f64
-                                    / dt)
-                                    .round() as u64;
+                                malformed_pps =
+                                    ((cur.malformed_count.wrapping_sub(prev_stats.malformed_count))
+                                        as f64
+                                        / dt)
+                                        .round() as u64;
                             }
                             prev_stats = cur;
                             stats_initialized = true;
@@ -1243,7 +1266,10 @@ mod tests {
              eth0\t00000A0A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",
             gw_hex
         );
-        assert_eq!(parse_ipv4_route_table(&proc_route, "eth0"), Some(gw_expected));
+        assert_eq!(
+            parse_ipv4_route_table(&proc_route, "eth0"),
+            Some(gw_expected)
+        );
     }
 
     #[test]
@@ -1261,8 +1287,14 @@ IP address       HW type     Flags       HW address            Mask     Device\n
 10.10.0.1        0x1         0x0         00:00:00:00:00:00     *        eth0\n\
 10.10.0.2        0x1         0x2         ff:ff:ff:ff:ff:ff     *        eth0\n\
 10.10.0.3        0x1         0x2         02:aa:bb:cc:dd:ee     *        eth0\n";
-        assert_eq!(parse_arp_table(arp, Ipv4Addr::new(10, 10, 0, 1), "eth0"), None);
-        assert_eq!(parse_arp_table(arp, Ipv4Addr::new(10, 10, 0, 2), "eth0"), None);
+        assert_eq!(
+            parse_arp_table(arp, Ipv4Addr::new(10, 10, 0, 1), "eth0"),
+            None
+        );
+        assert_eq!(
+            parse_arp_table(arp, Ipv4Addr::new(10, 10, 0, 2), "eth0"),
+            None
+        );
         assert_eq!(
             parse_arp_table(arp, Ipv4Addr::new(10, 10, 0, 3), "eth0"),
             Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
