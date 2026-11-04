@@ -76,8 +76,6 @@ jobs:
 
       - name: Cache Cargo Dependencies and Build Artifacts
         uses: swatinem/rust-cache@v2
-        with:
-          cache-all-targets: "true"
 
       - name: Install bpf-linker
         uses: taiki-e/install-action@v2
@@ -85,6 +83,8 @@ jobs:
           tool: bpf-linker
 
       - name: Compile Ring 0 eBPF Core (bpfel-unknown-none)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           echo "=========================================================="
           echo "[+] Compiling eBPF Kernel Bytecode (bpfel-unknown-none)..."
@@ -99,6 +99,8 @@ jobs:
           python3 -c "h = open('target/bpfel-unknown-none/release/aegis', 'rb').read(4); assert h == b'\x7fELF', f'Invalid ELF magic: {h}'; print('[+] eBPF binary ELF header validated.')"
 
       - name: Compile Ring 3 Apex Control Plane Daemon
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           echo "=========================================================="
           echo "[+] Compiling Userspace Daemon (aegis)..."
@@ -110,6 +112,8 @@ jobs:
           file target/release/aegis
 
       - name: Execute Full Rust Workspace Unit Tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           echo "=========================================================="
           echo "[+] Executing Kernel ABI & Algorithms Unit Tests..."
@@ -117,12 +121,22 @@ jobs:
           cargo test -p aegis-common -p aegis --verbose -- --nocapture
 
       - name: Clippy Linter Verification
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           cargo clippy -p aegis-common --all-targets -- -D warnings || true
           cargo clippy -p aegis --all-targets -- -D warnings || true
 
       - name: Live Kernel XDP Smoke & Graceful Shutdown Test
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
+          echo "=========================================================="
+          echo "[+] Configuring Kernel Memory & Limit Parameters..."
+          echo "=========================================================="
+          sudo sysctl -w kernel.perf_event_mlock_kb=512000 || true
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited || true
+
           echo "=========================================================="
           echo "[+] Staging Configuration Files..."
           echo "=========================================================="
@@ -140,15 +154,25 @@ jobs:
           sudo ip link set veth-peer up
 
           echo "[+] Spawning Aegis on veth-aegis..."
-          sudo ./target/release/aegis veth-aegis > aegis.log 2>&1 &
-          AEGIS_PID=$!
-          sleep 3
+          sudo -E ./target/release/aegis veth-aegis > aegis.log 2>&1 &
+          AEGIS_SUDO_PID=$!
+          sleep 4
+
+          # Resolve child aegis process or sudo process
+          AEGIS_PID=$(pgrep -f "target/release/aegis" | head -n 1 || echo "")
+          if [ -z "$AEGIS_PID" ]; then
+            AEGIS_PID=$AEGIS_SUDO_PID
+          fi
 
           if kill -0 $AEGIS_PID 2>/dev/null; then
             echo "[+] Aegis is active and attached to XDP hook (PID: $AEGIS_PID)."
           else
-            echo "[!] Aegis failed to initialize. Displaying diagnostic logs:"
-            cat aegis.log
+            echo "[!] Aegis process is not running. Diagnostic log output:"
+            cat aegis.log || true
+            echo "### Aegis Failure Log" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat aegis.log >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -156,17 +180,20 @@ jobs:
           python3 test_flood.py 198.51.100.1 udp 2 || true
 
           echo "[+] Delivering SIGINT for graceful XDP detachment..."
-          sudo kill -SIGINT $AEGIS_PID || true
+          sudo kill -SIGINT $AEGIS_PID 2>/dev/null || true
           sleep 2
           
-          echo "[+] Recent runtime logs from Aegis:"
-          head -n 30 aegis.log || true
+          echo "### Aegis Live Test Log" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          head -n 40 aegis.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
           echo "[+] Cleaning up test interfaces..."
           sudo ip link del veth-aegis 2>/dev/null || true
           echo "[+] Live kernel smoke test passed without errors."
 
       - name: Archive Production Release Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ghost-shield-linux-x86_64
@@ -176,4 +203,5 @@ jobs:
             config.json
             start.sh
             Makefile
+            aegis.log
           retention-days: 14
